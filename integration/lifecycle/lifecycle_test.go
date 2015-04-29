@@ -10,6 +10,7 @@ import (
 	"os"
 	"os/exec"
 	"path/filepath"
+	"strconv"
 	"strings"
 	"sync"
 	"time"
@@ -1050,4 +1051,83 @@ var _ = Describe("Creating a container", func() {
 			})
 		})
 	})
+
+	Describe("CPU limits", func() {
+		var containers [2]garden.Container
+		var client garden.Client
+
+		BeforeEach(func() {
+			client = startGarden()
+			containers[0] = createContainer(client)
+			containers[1] = createContainer(client)
+		})
+
+		AfterEach(func() {
+			for _, c := range containers {
+				Expect(client.Destroy(c.Handle())).Should(Succeed())
+			}
+		})
+
+		FIt("limits cpu, maybe", func() {
+			setCPU := func(container garden.Container, limit uint64) error {
+				return container.LimitCPU(garden.CPULimits{LimitInShares: limit})
+			}
+			Expect(setCPU(containers[0], 1)).Should(Succeed())
+			Expect(setCPU(containers[1], 9)).Should(Succeed())
+
+			var processes [2]garden.Process
+			var stdouts [2]*bytes.Buffer
+			var err error
+			for i, c := range containers {
+				buf := make([]byte, 0, 1024*1024)
+				stdout := bytes.NewBuffer(buf)
+				stdouts[i] = stdout
+				output := gbytes.NewBuffer()
+				process, err := c.Run(garden.ProcessSpec{
+					Path: "ls",
+					Args: []string{"-al", "tools"},
+				}, garden.ProcessIO{
+					Stdout: output,
+				})
+				Expect(err).ShouldNot(HaveOccurred())
+				Expect(process.Wait()).To(Equal(0))
+				fmt.Println("tools", string(output.Contents()))
+				processes[i], err = c.Run(garden.ProcessSpec{
+					Path: "tools/consume",
+					Args: []string{"fork", "cpu", "10s"},
+				}, garden.ProcessIO{Stdout: stdout})
+				Expect(err).ShouldNot(HaveOccurred())
+			}
+
+			for _, p := range processes {
+				exitCode, err := p.Wait()
+				Expect(err).ToNot(HaveOccurred())
+				Expect(exitCode).To(Equal(0))
+			}
+
+			var userTimes [2]int
+			for i, s := range stdouts {
+				stdout := strings.TrimSpace(s.String())
+				userTime := strings.Split(stdout, ",")[1]
+				userTimes[i], err = strconv.Atoi(strings.Split(userTime, ": ")[1])
+				Expect(err).ToNot(HaveOccurred())
+			}
+			ratio := float64(userTimes[0]) / float64(userTimes[1])
+			Expect(ratio).To(BeNumerically(">=", 0.05))
+			Expect(ratio).To(BeNumerically("<=", 0.7))
+		})
+	})
 })
+
+func createContainer(client garden.Client) garden.Container {
+	container, err := client.Create(garden.ContainerSpec{Privileged: false, RootFSPath: ""})
+	Expect(err).ShouldNot(HaveOccurred())
+	tgz, err := os.Open("../bin/consume.tgz")
+	Expect(err).ToNot(HaveOccurred())
+
+	tarStream, err := gzip.NewReader(tgz)
+	Expect(err).ToNot(HaveOccurred())
+	err = container.StreamIn("tools", tarStream)
+	Expect(err).ShouldNot(HaveOccurred())
+	return container
+}
